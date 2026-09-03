@@ -100,12 +100,20 @@ class LLMEngine:
                 os.getenv("INFINILM_MAX_NUM_BATCHED_TOKENS", max_position_embeddings)
             )
             assert 1024 <= max_num_batched_tokens <= max_position_embeddings
+            max_consecutive_prefill_batches = int(
+                os.getenv("INFINILM_MAX_CONSECUTIVE_PREFILL_BATCHES", "2")
+            )
+            if max_consecutive_prefill_batches < 1:
+                raise ValueError(
+                    "INFINILM_MAX_CONSECUTIVE_PREFILL_BATCHES must be positive"
+                )
 
             self.scheduler = Scheduler(
                 max_batch_size=config.max_batch_size,
                 num_blocks=config.num_blocks,
                 block_size=config.block_size,
                 max_num_batched_tokens=max_num_batched_tokens,
+                max_consecutive_prefill_batches=max_consecutive_prefill_batches,
                 connector=connector,
                 has_mamba_cache=has_mamba_cache,
                 num_mamba_cache_blocks=num_mamba_cache_blocks,

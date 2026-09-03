@@ -81,11 +81,13 @@ class BlockManager:
         self.hash_to_block_ids: Dict[BlockHash, Set[int]] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: Set[int] = set()
+        self.evictable_block_ids: Set[int] = set()
 
     def __repr__(self) -> str:
         return (
             f"BlockManager(blocks={self.num_blocks}, block_size={self.block_size}, "
-            f"free={len(self.free_block_ids)}, used={len(self.used_block_ids)})"
+            f"free={len(self.free_block_ids)}, used={len(self.used_block_ids)}, "
+            f"evictable={len(self.evictable_block_ids)})"
         )
 
     def _allocate_block(self) -> Block:
@@ -114,6 +116,9 @@ class BlockManager:
         assert block.ref_count == 0, (
             f"Block {block_id} ref_count not zero, cannot deallocate"
         )
+        if block_id not in self.evictable_block_ids:
+            raise RuntimeError(f"unreferenced block {block_id} is not evictable")
+        self.evictable_block_ids.remove(block_id)
         self._remove_block_hash(block)
         block.free()
         self.used_block_ids.remove(block_id)
@@ -126,12 +131,7 @@ class BlockManager:
         return len(self.free_block_ids)
 
     def get_total_usable_blocks(self) -> int:
-        freeable_used_blocks = sum(
-            1
-            for block_id in self.used_block_ids
-            if self.blocks[block_id].ref_count == 0
-        )
-        return len(self.free_block_ids) + freeable_used_blocks
+        return len(self.free_block_ids) + len(self.evictable_block_ids)
 
     def get_computed_blocks(
         self,
@@ -151,6 +151,8 @@ class BlockManager:
             block_id = next(iter(block_ids))
             block = self.blocks[block_id]
             assert block.hash == block_hash and block_id in self.used_block_ids
+            if block.ref_count == 0:
+                self.evictable_block_ids.remove(block_id)
             block.ref_count += 1
             cached_block_table.append(block_id)
         return cached_block_table, len(cached_block_table) * self.block_size
@@ -277,6 +279,7 @@ class BlockManager:
         for block_id in discarded_block_ids:
             block = self.blocks[block_id]
             block.ref_count = 0
+            self.evictable_block_ids.add(block_id)
             self._deallocate_block(block_id)
 
         return block_table[:keep_blocks]
@@ -333,18 +336,14 @@ class BlockManager:
             block = self.blocks[block_id]
             assert block.ref_count > 0, "block ref_count must be greater than 0"
             block.ref_count -= 1
+            if block.ref_count == 0:
+                self.evictable_block_ids.add(block_id)
 
     def try_free_blocks(self, num_required: int) -> bool:
         """Evict unreferenced blocks until the requested capacity is available."""
-        to_free = [
-            block_id
-            for block_id in self.used_block_ids
-            if self.blocks[block_id].ref_count == 0
-        ]
-        for block_id in to_free:
+        while not self.can_allocate(num_required) and self.evictable_block_ids:
+            block_id = next(iter(self.evictable_block_ids))
             self._deallocate_block(block_id)
-            if self.can_allocate(num_required):
-                return True
         return self.can_allocate(num_required)
 
     def update_blocks_slot(

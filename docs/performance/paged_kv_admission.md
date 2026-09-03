@@ -19,6 +19,10 @@ enter and leave the running queue. Each request's contribution is calculated
 from its target token limit and current block table, so existing unused block
 capacity is included.
 
+The block manager also tracks unreferenced, evictable pages directly. Usable
+capacity checks are now `O(1)`, and eviction iterates only evictable pages
+instead of scanning all used pages.
+
 `get_cache_stats()` exposes `num_reserved_decode_blocks` for diagnostics.
 
 ## Correctness Tests
@@ -29,6 +33,8 @@ The unit tests cover:
 - Counter updates as a request leaves and re-enters the running queue.
 - Counter cleanup for a canceled queued request.
 - The public cache statistics field.
+- Evictable-page accounting across release, prefix reuse, allocation, and
+  speculative truncation.
 
 Run the tests in an installed InfiniLM development environment:
 
@@ -62,6 +68,30 @@ Result on an Apple M4 MacBook Air with 24 GB memory and Python 3.12.14:
 The measured admission-check speedup was `25.03x` for this workload. The exact
 calculation reserves no additional decode blocks because all 128 output tokens
 fit in the partially used second block of each request.
+
+The benchmark also reports usable-capacity lookup separately. This compares
+the previous scan of all used blocks with the incrementally tracked evictable
+set and verifies that both return the same capacity. On the RTX 4090 test host,
+10,000 lookups took `0.254017 s` with scanning and `0.001380 s` with tracking,
+a `184.13x` speedup for this control-plane operation.
+
+## Bounded Prefill Bursts
+
+Prompt batches previously had unconditional priority over decode batches. A
+large arrival wave could therefore run many consecutive prefills and pause
+token generation for requests already in flight. Once at least one request has
+entered decode, the scheduler now runs at most two consecutive prefill batches
+before forcing a decode batch. Cold-start prefill batching is unchanged.
+
+Tune the latency/throughput tradeoff at server startup:
+
+```bash
+INFINILM_MAX_CONSECUTIVE_PREFILL_BATCHES=2 python \
+  python/infinilm/server/inference_server.py ...
+```
+
+The value must be positive. Lower values protect inter-token latency more
+aggressively; higher values favor prompt throughput and TTFT for new arrivals.
 
 ## GPU Serving Benchmark
 
@@ -221,8 +251,15 @@ normal GPU-bound workload.
 
 ## Limitations And Next Measurement
 
-The current `25.03x` result is a scheduler control-plane microbenchmark, not an
-end-to-end model throughput result. The staged benchmark has not yet been run
-on NVIDIA hardware. `BlockManager.get_total_usable_blocks()` still scans used
-blocks; tracking evictable capacity incrementally is a possible follow-up if
-GPU-side profiling shows that it remains significant.
+The `25.03x` result is a scheduler control-plane microbenchmark, not an
+end-to-end model throughput result. On an RTX 4090 with TinyLlama 1.1B, one
+256+128 request-wave run reduced wave 2 TTFT p50 from `8379.57 ms` to
+`1932.61 ms` and raised output throughput from `4996.93` to `5677.45 tok/s`.
+That run also exposed a TPOT p50 regression from `41.36 ms` to `59.22 ms`,
+which motivated bounded prefill bursts.
+
+With a burst limit of two, four subsequent runs produced TPOT p50 values of
+`54.84`, `56.46`, `56.27`, and `57.77 ms`. Three contemporaneous runs with the
+limit effectively disabled produced `58.90`, `59.53`, and `65.18 ms`. GPU
+throughput varied materially between runs, so alternate configurations and
+collect at least five samples before drawing hardware-level conclusions.

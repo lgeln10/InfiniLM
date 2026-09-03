@@ -3,10 +3,14 @@
 
 import argparse
 import time
+from collections.abc import Callable
+from typing import TypeVar
 
 from infinilm.llm.request import InferenceRequest, RequestStatus
 from infinilm.llm.sampling_params import SamplingParams
 from infinilm.llm.scheduler import Scheduler
+
+T = TypeVar("T")
 
 
 def make_request(
@@ -51,10 +55,22 @@ def legacy_can_accept_request(
     return total_required_blocks <= scheduler.cache_manager.get_total_usable_blocks()
 
 
-def measure(function, iterations: int) -> tuple[float, bool]:
-    result = False
+def scanned_total_usable_blocks(scheduler: Scheduler) -> int:
+    manager = scheduler.cache_manager
+    freeable_used_blocks = sum(
+        1
+        for block_id in manager.used_block_ids
+        if manager.blocks[block_id].ref_count == 0
+    )
+    return manager.get_num_free_blocks() + freeable_used_blocks
+
+
+def measure(function: Callable[[], T], iterations: int) -> tuple[float, T]:
+    if iterations < 1:
+        raise ValueError("iterations must be positive")
     start = time.perf_counter()
-    for _ in range(iterations):
+    result = function()
+    for _ in range(1, iterations):
         result = function()
     return time.perf_counter() - start, result
 
@@ -93,6 +109,12 @@ def main() -> None:
     optimized_seconds, optimized_result = measure(
         lambda: scheduler.can_accept_request(candidate, 0), args.iterations
     )
+    scanned_capacity_seconds, scanned_capacity = measure(
+        lambda: scanned_total_usable_blocks(scheduler), args.iterations
+    )
+    tracked_capacity_seconds, tracked_capacity = measure(
+        scheduler.cache_manager.get_total_usable_blocks, args.iterations
+    )
     legacy_blocks = legacy_running_reservation(scheduler)
     exact_blocks = scheduler.get_cache_stats()["num_reserved_decode_blocks"]
 
@@ -104,6 +126,17 @@ def main() -> None:
     print(f"legacy queue scan: {legacy_seconds:.6f} s")
     print(f"incremental accounting: {optimized_seconds:.6f} s")
     print(f"speedup: {legacy_seconds / optimized_seconds:.2f}x")
+    print(f"scanned usable capacity: {scanned_capacity_seconds:.6f} s")
+    print(f"tracked usable capacity: {tracked_capacity_seconds:.6f} s")
+    print(
+        "usable capacity speedup: "
+        f"{scanned_capacity_seconds / tracked_capacity_seconds:.2f}x"
+    )
+    if scanned_capacity != tracked_capacity:
+        raise RuntimeError(
+            "tracked usable capacity differs from the scanned reference: "
+            f"{tracked_capacity} != {scanned_capacity}"
+        )
     print(f"legacy reserved blocks: {legacy_blocks}")
     print(f"exact reserved blocks: {exact_blocks}")
     print(f"legacy accepted candidate: {legacy_result}")

@@ -71,6 +71,7 @@ class Scheduler:
         has_mamba_cache: bool = False,
         num_mamba_cache_blocks: int | None = None,
         enable_prefix_caching: bool = True,
+        max_consecutive_prefill_batches: int = 2,
     ):
         self.waiting_queue = janus.Queue()
         self.running_queue = janus.Queue()
@@ -92,9 +93,14 @@ class Scheduler:
         self.speculative_cache_ops = SpeculativeCacheOps(self.cache_manager)
         self.block_size = block_size
         self.max_num_batched_tokens = max_num_batched_tokens
+        if max_consecutive_prefill_batches < 1:
+            raise ValueError("max_consecutive_prefill_batches must be positive")
+        self.max_consecutive_prefill_batches = max_consecutive_prefill_batches
         self.connector = connector
         self.enable_prefix_caching = enable_prefix_caching
         self._num_reserved_decode_blocks = 0
+        self._active_decode_request_ids: set[str] = set()
+        self._consecutive_prefill_batches = 0
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
@@ -135,9 +141,17 @@ class Scheduler:
         current_num_batched_tokens = 0
         current_prefill_extra_blocks = 0
 
-        # Process Waiting queue (prefill phase)
+        prioritize_decode = (
+            bool(self._active_decode_request_ids)
+            and self._consecutive_prefill_batches
+            >= self.max_consecutive_prefill_batches
+        )
+
+        # Process Waiting queue (prefill phase). Once decode is active, bound
+        # prefill bursts so newly arrived prompts cannot starve token generation.
         while (
-            len(scheduled_requests) < self.max_batch_size
+            not prioritize_decode
+            and len(scheduled_requests) < self.max_batch_size
             and current_num_batched_tokens < self.max_num_batched_tokens
         ):
             try:
@@ -295,6 +309,8 @@ class Scheduler:
 
         # Return prefill batch if any waiting requests were scheduled
         if scheduled_requests:
+            if self._active_decode_request_ids:
+                self._consecutive_prefill_batches += 1
             is_prefill = True
             scheduler_output = SchedulerOutput(
                 scheduled_requests=scheduled_requests,
@@ -357,6 +373,10 @@ class Scheduler:
 
         # Return decode batch if any running requests were scheduled
         if scheduled_requests:
+            self._active_decode_request_ids.update(
+                req.request_id for req in scheduled_requests
+            )
+            self._consecutive_prefill_batches = 0
             is_prefill = False
             scheduler_output = SchedulerOutput(
                 scheduled_requests=scheduled_requests,
@@ -414,6 +434,7 @@ class Scheduler:
                 RequestStatus.FAILED,
                 RequestStatus.TIMEOUT,
             ]:
+                self._active_decode_request_ids.discard(req.request_id)
                 delay_free_blocks = False
                 if self.connector is not None:
                     delay_free_blocks, _ = self.connector.request_finished(
@@ -580,6 +601,7 @@ class Scheduler:
             "num_free_blocks": self.cache_manager.get_num_free_blocks(),
             "usable_blocks": self.cache_manager.get_total_usable_blocks(),
             "num_used_blocks": len(self.cache_manager.used_block_ids),
+            "num_evictable_blocks": len(self.cache_manager.evictable_block_ids),
             "num_reserved_decode_blocks": self._num_reserved_decode_blocks,
         }
         if self.mamba_cache_manager is not None:
