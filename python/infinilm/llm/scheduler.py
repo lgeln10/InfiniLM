@@ -94,6 +94,7 @@ class Scheduler:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.connector = connector
         self.enable_prefix_caching = enable_prefix_caching
+        self._num_reserved_decode_blocks = 0
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
@@ -311,6 +312,9 @@ class Scheduler:
                 req = self.running_queue.sync_q.get_nowait()
             except queue.Empty:
                 break
+            self._num_reserved_decode_blocks -= self._get_decode_extra_blocks(req)
+            if self._num_reserved_decode_blocks < 0:
+                raise RuntimeError("Running decode block reservation became negative")
             # Skip requests that were already finished (e.g., timed out/canceled while running)
             if req.is_finished():
                 self.complete_requests([req])
@@ -448,6 +452,7 @@ class Scheduler:
                     )
             else:
                 # Still running, put back in running queue
+                self._num_reserved_decode_blocks += self._get_decode_extra_blocks(req)
                 self.running_queue.sync_q.put(req)
 
     def can_accept_request(
@@ -463,20 +468,7 @@ class Scheduler:
         ):
             return False
 
-        total_required_blocks = 0
-
-        # Calculate blocks needed for running requests
-        running_queue_size = self.running_queue.sync_q.qsize()
-        for _ in range(running_queue_size):
-            req = self.running_queue.sync_q.get()
-            remaining_tokens = (
-                req.sampling_params.max_tokens - req.get_num_generated_tokens()
-            )
-            num_blocks_needed = (
-                remaining_tokens + self.block_size - 1
-            ) // self.block_size
-            total_required_blocks += num_blocks_needed
-            self.running_queue.sync_q.put(req)
+        total_required_blocks = self._num_reserved_decode_blocks
 
         # Calculate blocks needed for the new request
         total_length = request.get_prompt_length() - num_local_computed_tokens
@@ -495,6 +487,10 @@ class Scheduler:
         return total_required_blocks <= self.cache_manager.get_total_usable_blocks()
 
     def _get_prefill_extra_blocks(self, request: InferenceRequest) -> int:
+        return self._get_decode_extra_blocks(request)
+
+    def _get_decode_extra_blocks(self, request: InferenceRequest) -> int:
+        """Return additional blocks needed to reach the request's token limit."""
         total_length = request.get_prompt_length()
         total_length += request.sampling_params.max_tokens
         total_required_blocks = (total_length + self.block_size - 1) // self.block_size
@@ -584,6 +580,7 @@ class Scheduler:
             "num_free_blocks": self.cache_manager.get_num_free_blocks(),
             "usable_blocks": self.cache_manager.get_total_usable_blocks(),
             "num_used_blocks": len(self.cache_manager.used_block_ids),
+            "num_reserved_decode_blocks": self._num_reserved_decode_blocks,
         }
         if self.mamba_cache_manager is not None:
             stats.update(
